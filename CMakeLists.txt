@@ -220,6 +220,24 @@ else()
 endif()
 
 # =======================
+# Find or Fetch xsimd (header-only SIMD abstraction)
+# =======================
+set(XSIMD_PATH "${CMAKE_CURRENT_SOURCE_DIR}/third_party/xsimd/include")
+if(NOT EXISTS "${XSIMD_PATH}/xsimd/xsimd.hpp")
+    message(STATUS "xsimd not found, downloading...")
+    FetchContent_Declare(
+        xsimd
+        GIT_REPOSITORY https://github.com/xtensor-stack/xsimd.git
+        GIT_TAG        13.0.0
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(xsimd)
+    set(XSIMD_INCLUDE_DIR "${xsimd_SOURCE_DIR}/include")
+else()
+    set(XSIMD_INCLUDE_DIR "${XSIMD_PATH}")
+endif()
+
+# =======================
 # Find Other Dependencies
 # =======================
 find_package(Threads REQUIRED)
@@ -288,6 +306,7 @@ target_include_directories(ndd_core PRIVATE
     ${ASIO_INCLUDE_DIR}
     ${OPENSSL_INCLUDE_DIR}
     ${CURL_INCLUDE_DIRS}
+    ${XSIMD_INCLUDE_DIR}
 )
 target_include_directories(${NDD_BINARY_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -303,6 +322,7 @@ target_include_directories(${NDD_BINARY_NAME} PRIVATE
     ${ASIO_INCLUDE_DIR}
     ${OPENSSL_INCLUDE_DIR}
     ${CURL_INCLUDE_DIRS}
+    ${XSIMD_INCLUDE_DIR}
 )
 
 # Set compiler flags

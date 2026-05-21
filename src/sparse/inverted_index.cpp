@@ -17,7 +17,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <xsimd/xsimd.hpp>
 
+namespace xs = xsimd;
 namespace ndd {
 
     namespace {
@@ -136,6 +138,7 @@ namespace ndd {
                  << (parse_calls ? (static_cast<double>(parse_total_ns) / 1000.0)
                                            / static_cast<double>(parse_calls)
                                  : 0.0));
+        LOG_INFO("xsimd batch size (floats/vector): " << xs::batch<float>::size);
         std::cout << "=================================\n";
     }
 
@@ -688,20 +691,70 @@ namespace ndd {
 
             {
                 LOG_TIME("search phase 3");
-            // Only scores inside the current batch can be non-zero, so convert that temporary
-            // dense buffer into top-k candidates before moving to the next window.
-            for (size_t local = 0; local < batch_len; local++) {
+            // Only scores inside the current batch can be non-zero. We use AVX2 to instantly
+            // skip segments that don't beat the threshold, preventing branch mispredictions.
+            // Passing candidates are pushed into the Min-Heap to maintain the Top-K.
+            size_t local = 0;
+            using batch_type = xs::batch<float>; 
+            constexpr size_t inc = batch_type::size;
+
+            batch_type thresh_vec = batch_type::broadcast(threshold);
+
+            for (; local + inc - 1 < batch_len; local += inc) {
+                // Load 4 unaligned floats from memory
+                batch_type scores = xs::load_unaligned(&scores_buf[local]);
+                
+                // Perform SIMD comparison against the threshold vector
+                auto cmp_mask = scores > thresh_vec; 
+                
+                // Extract the integer bitmask. 
+                // For 4 elements, this generates a 4-bit mask (0b0000 to 0b1111)
+                uint32_t mask = static_cast<uint32_t>(cmp_mask.mask());
+                
+                // Fast skip: All 4 elements are <= threshold. Avoid branch misprediction.
+                if (mask == 0) continue; 
+                
+                while (mask != 0) {
+                    // Find the index of the first 1-bit (0, 1, 2, or 3)
+                    int bit_idx = __builtin_ctz(mask); 
+                    size_t exact_local = local + bit_idx;
+                    ndd::idInt doc_id = batch_start + (ndd::idInt)exact_local;
+                    
+                    if (!filter || filter->contains(doc_id)) {
+                        float s = scores_buf[exact_local];
+                        
+                        if (top_results.size() < k) {
+                            top_results.emplace(doc_id, s);
+                            if (top_results.size() == k) {
+                                // Update scalar threshold and immediately broadcast to SIMD register
+                                threshold = top_results.top().score;
+                                thresh_vec = batch_type::broadcast(threshold); 
+                            }
+                        } else if (s > threshold) {
+                            top_results.pop();
+                            top_results.emplace(doc_id, s);
+                            // Update scalar threshold and immediately broadcast to SIMD register
+                            threshold = top_results.top().score;
+                            thresh_vec = batch_type::broadcast(threshold); 
+                        }
+                    }
+                    
+                    // Clear the lowest set bit to process the next valid element in the chunk of 4
+                    mask &= (mask - 1);
+                }
+            }
+
+            // Tail loop to handle the remaining elements (0 to 3 elements left over)
+            for (; local < batch_len; local++) {
                 float s = scores_buf[local];
-                if (s == 0.0f || s <= threshold) continue;
+                if (s <= threshold) continue;
 
                 ndd::idInt doc_id = batch_start + (ndd::idInt)local;
                 if (filter && !filter->contains(doc_id)) continue;
 
                 if (top_results.size() < k) {
                     top_results.emplace(doc_id, s);
-                    if (top_results.size() == k) {
-                        threshold = top_results.top().score;
-                    }
+                    if (top_results.size() == k) threshold = top_results.top().score;
                 } else if (s > threshold) {
                     top_results.pop();
                     top_results.emplace(doc_id, s);
